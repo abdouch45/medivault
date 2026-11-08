@@ -5,20 +5,29 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-supersecret_admin_pw}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB:-medivault}
-      MEDIVAULT_ENC_KEY: ${MEDIVAULT_ENC_KEY:-dev_master_encryption_key_2026}
-    ports:
-      - "5432:5432"
+      MEDIVAULT_ENC_KEY: ${MEDIVAULT_ENC_KEY}
+      PW_DR_HOUSE: ${PW_DR_HOUSE}
+      PW_DR_WILSON: ${PW_DR_WILSON}
+      PW_NURSE_JOY: ${PW_NURSE_JOY}
+      PW_RECEP_PAM: ${PW_RECEP_PAM}
+      PW_PAT_ALICE: ${PW_PAT_ALICE}
+      PW_PAT_BOB: ${PW_PAT_BOB}
+      PW_SVC_BILLING: ${PW_SVC_BILLING}
+      PW_AUD_SMITH: ${PW_AUD_SMITH}
+      PW_ADM_ROOT: ${PW_ADM_ROOT}
+    # No ports published — Postgres is reachable only inside the Docker network.
+    # pgAdmin connects via medivault-net; nothing on the host can reach port 5432 directly.
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./init-scripts:/docker-entrypoint-initdb.d:ro
       - ./backups:/backups
-      # Uncomment below after completing Section 2 (Baseline Analysis) to apply hardening:
-      # - ./config/postgresql.hardened.conf:/etc/postgresql/postgresql.conf:ro
-      # - ./config/pg_hba.hardened.conf:/etc/postgresql/pg_hba.conf:ro
-    # Uncomment command below when using hardened config files:
-    # command: postgres -c config_file=/etc/postgresql/postgresql.conf -c hba_file=/etc/postgresql/pg_hba.conf
+      - ./config/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+    command: postgres -c hba_file=/etc/postgresql/pg_hba.conf
+    networks:
+      medivault-net:
+        ipv4_address: 172.28.0.2
 
   pgadmin:
     image: dpage/pgadmin4:latest
@@ -28,9 +37,19 @@ services:
       PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:-admin@medivault.lu}
       PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:-admin123}
     ports:
-      - "5050:80"
+      - "127.0.0.1:5050:80"
     depends_on:
       - medivault-db
+    networks:
+      medivault-net:
+        ipv4_address: 172.28.0.3
+
+networks:
+  medivault-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
 
 volumes:
   pgdata:

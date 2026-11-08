@@ -1,3 +1,5 @@
 .env
 backups/*.sql*
 backups/*.dump*
+config/pg_hba.conf
+config/set-passwords.sql

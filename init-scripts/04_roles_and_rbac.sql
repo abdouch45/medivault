@@ -9,10 +9,11 @@ CREATE ROLE role_receptionist NOLOGIN;
 CREATE ROLE role_patient NOLOGIN;
 CREATE ROLE role_billing_service NOLOGIN;
 CREATE ROLE role_auditor NOLOGIN;
-CREATE ROLE role_admin NOLOGIN CREATEROLE;
+CREATE ROLE role_admin NOLOGIN;
 
 -- 1. DOCTOR Permissions
-GRANT SELECT ON Patient TO role_doctor;
+-- billing_address excluded: doctors need patient identity, not billing data
+GRANT SELECT (patient_id, name, date_of_birth, phone) ON Patient TO role_doctor;
 GRANT SELECT, UPDATE (name, specialty) ON Doctor TO role_doctor;
 GRANT SELECT, UPDATE (status) ON Appointment TO role_doctor;
 GRANT SELECT, INSERT, UPDATE ON MedicalRecord TO role_doctor;
@@ -32,7 +33,8 @@ GRANT SELECT (patient_id, name, date_of_birth, phone, email, billing_address),
       UPDATE (name, date_of_birth, phone, email, billing_address) ON Patient TO role_receptionist;
 GRANT USAGE, SELECT ON SEQUENCE patient_patient_id_seq TO role_receptionist;
 GRANT SELECT (staff_id, name, specialty) ON Doctor TO role_receptionist;
-GRANT SELECT, INSERT, UPDATE, DELETE ON Appointment TO role_receptionist;
+-- DELETE removed: cancellation is an UPDATE (status='cancelled'), not a hard delete
+GRANT SELECT, INSERT, UPDATE ON Appointment TO role_receptionist;
 GRANT USAGE, SELECT ON SEQUENCE appointment_appointment_id_seq TO role_receptionist;
 GRANT SELECT ON Invoice TO role_receptionist;
 

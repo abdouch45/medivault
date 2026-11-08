@@ -1,0 +1,23 @@
+# PostgreSQL Client Authentication Configuration
+# Generated from this template by scripts/setup.sh (substitutes TRUSTED_IP_HERE)
+# Do not edit config/pg_hba.conf directly — edit this template and re-run setup.sh
+#
+# TYPE  DATABASE   USER        ADDRESS              METHOD
+
+# [1] Unix socket: all users require password
+#     docker exec medivault_postgres psql -U postgres -W
+local   all        all                              scram-sha-256
+
+# [2] TCP — always block postgres superuser; local socket is the only path
+host    all        postgres    0.0.0.0/0            reject
+host    all        postgres    ::/0                 reject
+
+# [3] TCP — pgAdmin container only (fixed IP defined in docker-compose.yml)
+host    medivault  all         172.28.0.3/32        scram-sha-256
+
+# [4] TCP — Trusted external IP (set TRUSTED_IP in .env, then run scripts/setup.sh)
+host    medivault  all         TRUSTED_IP_HERE/32   scram-sha-256
+
+# [5] Reject everything else
+host    all        all         0.0.0.0/0            reject
+host    all        all         ::/0                 reject
