@@ -1,0 +1,36 @@
+services:
+  medivault-db:
+    image: postgres:16-alpine
+    container_name: medivault_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-supersecret_admin_pw}
+      POSTGRES_DB: ${POSTGRES_DB:-medivault}
+      MEDIVAULT_ENC_KEY: ${MEDIVAULT_ENC_KEY:-dev_master_encryption_key_2026}
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./init-scripts:/docker-entrypoint-initdb.d:ro
+      - ./backups:/backups
+      # Uncomment below after completing Section 2 (Baseline Analysis) to apply hardening:
+      # - ./config/postgresql.hardened.conf:/etc/postgresql/postgresql.conf:ro
+      # - ./config/pg_hba.hardened.conf:/etc/postgresql/pg_hba.conf:ro
+    # Uncomment command below when using hardened config files:
+    # command: postgres -c config_file=/etc/postgresql/postgresql.conf -c hba_file=/etc/postgresql/pg_hba.conf
+
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: medivault_pgadmin
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:-admin@medivault.lu}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:-admin123}
+    ports:
+      - "5050:80"
+    depends_on:
+      - medivault-db
+
+volumes:
+  pgdata:
