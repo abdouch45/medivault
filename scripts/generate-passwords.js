@@ -24,7 +24,16 @@ const gen = {
   PW_SVC_BILLING:    pwd(32),
   PW_AUD_SMITH:      pwd(32),
   PW_ADM_ROOT:       pwd(32),
+  BACKUP_ENC_KEY:    pwd(48),  // pgBackRest AES-256 repo passphrase (separate from DB passwords)
+  GARAGE_RPC_SECRET: crypto.randomBytes(32).toString('hex'),
+  GARAGE_ADMIN_TOKEN: pwd(40),
+  // Garage key formats: id = "GK" + 24 hex, secret = 64 hex
+  GARAGE_KEY_ID:     'GK' + crypto.randomBytes(12).toString('hex'),  // S3 user "postgres"
+  AUDIT_KEY_ID:      'GK' + crypto.randomBytes(12).toString('hex'),  // S3 user "audit-shipper"
+  AUDIT_KEY_SECRET:  crypto.randomBytes(32).toString('hex'),
 };
+// S3 user "postgres" uses POSTGRES_PASSWORD as its password, hashed into Garage's 64-hex secret format.
+gen.GARAGE_KEY_SECRET = crypto.createHash('sha256').update(gen.POSTGRES_PASSWORD).digest('hex');
 
 // --- .env: replace every generated key in .env.example ---
 const template = fs.readFileSync(path.join(ROOT, '.env.example'), 'utf8');

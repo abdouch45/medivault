@@ -1,0 +1,12 @@
+# TLS in front of Garage: pgBackRest only speaks S3 over HTTPS.
+# Self-signed (tls internal) — clients use verify-tls=n inside the private network.
+{
+	admin off
+	auto_https disable_redirects
+	skip_install_trust
+}
+
+https://garage-tls {
+	tls internal
+	reverse_proxy garage:3900
+}

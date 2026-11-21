@@ -1,9 +1,45 @@
+# pgBackRest settings shared by every container that touches the backup repo.
+# Repo = Garage bucket over TLS; every file (backups + WAL) is AES-256 encrypted with BACKUP_ENC_KEY.
+x-pgbackrest-env: &pgbackrest-env
+  PGBACKREST_STANZA: medivault
+  PGBACKREST_PG1_PATH: /var/lib/postgresql/data
+  PGBACKREST_PG1_SOCKET_PATH: /var/run/postgresql
+  PGBACKREST_REPO1_TYPE: s3
+  PGBACKREST_REPO1_PATH: /pgbackrest
+  PGBACKREST_REPO1_S3_ENDPOINT: garage-tls
+  PGBACKREST_REPO1_S3_BUCKET: ${BACKUP_BUCKET:-medivault-backups}
+  PGBACKREST_REPO1_S3_REGION: garage
+  PGBACKREST_REPO1_S3_URI_STYLE: path
+  PGBACKREST_REPO1_STORAGE_VERIFY_TLS: "n"   # self-signed Caddy cert, private network only
+  PGBACKREST_REPO1_S3_KEY: ${GARAGE_KEY_ID}
+  PGBACKREST_REPO1_S3_KEY_SECRET: ${GARAGE_KEY_SECRET}
+  PGBACKREST_REPO1_CIPHER_TYPE: aes-256-cbc
+  PGBACKREST_REPO1_CIPHER_PASS: ${BACKUP_ENC_KEY}
+  PGBACKREST_REPO1_RETENTION_FULL: ${BACKUP_RETENTION_FULL:-4}
+  PGBACKREST_COMPRESS_TYPE: zst
+  PGBACKREST_LOG_LEVEL_FILE: "off"
+
+# Built once by medivault-db; the other services reuse the local image.
+x-pg-image: &pg-image
+  image: medivault-postgres:16
+  pull_policy: never
+
 services:
   medivault-db:
-    image: postgres:16-alpine
+    image: medivault-postgres:16
+    build:
+      context: ./infra
+      dockerfile: postgres.Dockerfile
     container_name: medivault_postgres
     restart: unless-stopped
+    # Backups run in here (infra/backup-loop.sh): data is compressed + AES-256 encrypted on the
+    # DB server itself, only ciphertext goes to Garage. init: true reaps the detached loop.
+    init: true
+    entrypoint: ["db-entrypoint.sh"]
     environment:
+      <<: *pgbackrest-env
+      BACKUP_FULL_INTERVAL_MIN: ${BACKUP_FULL_INTERVAL_MIN:-15}
+      BACKUP_INCR_INTERVAL_MIN: ${BACKUP_INCR_INTERVAL_MIN:-5}
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB:-medivault}
@@ -21,10 +57,15 @@ services:
     # pgAdmin connects via medivault-net; nothing on the host can reach port 5432 directly.
     volumes:
       - pgdata:/var/lib/postgresql/data
+      - pgsocket:/var/run/postgresql
+      - pglogs:/var/log/postgresql
       - ./init-scripts:/docker-entrypoint-initdb.d:ro
-      - ./backups:/backups
       - ./config/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
-    command: postgres -c hba_file=/etc/postgresql/pg_hba.conf
+      - ./config/postgresql.conf:/etc/postgresql/postgresql.conf:ro
+    command: postgres -c config_file=/etc/postgresql/postgresql.conf -c log_rotation_age=${LOG_ROTATION_MIN:-1}min
+    depends_on:
+      garage-init:
+        condition: service_completed_successfully
     networks:
       medivault-net:
         ipv4_address: 172.28.0.2
@@ -44,6 +85,99 @@ services:
       medivault-net:
         ipv4_address: 172.28.0.3
 
+  # Log shipper: sends finished log files + audit-chain anchors to the audit bucket, prunes old logs.
+  # Least privilege: no data files, no backup key, connects as the auditor (aud_smith), not postgres.
+  medivault-logship:
+    <<: *pg-image
+    container_name: medivault_logship
+    restart: unless-stopped
+    user: postgres
+    entrypoint: ["log-shipper.sh"]
+    environment:
+      PGUSER: aud_smith
+      PGPASSWORD: ${PW_AUD_SMITH}
+      AUDIT_BUCKET: ${AUDIT_BUCKET:-medivault-audit}
+      AUDIT_KEY_ID: ${AUDIT_KEY_ID}
+      AUDIT_KEY_SECRET: ${AUDIT_KEY_SECRET}
+      LOG_KEEP_DAYS: ${LOG_KEEP_DAYS:-7}
+    volumes:
+      - pgsocket:/var/run/postgresql
+      - pglogs:/var/log/postgresql
+    depends_on:
+      - medivault-db
+    networks:
+      medivault-net:
+        ipv4_address: 172.28.0.13
+
+  # Migration / test server: restores the latest encrypted backup from Garage on first start.
+  # Archiving is off so it never writes into the production backup repo.
+  medivault-test:
+    <<: *pg-image
+    container_name: medivault_test
+    restart: unless-stopped
+    entrypoint: ["test-entrypoint.sh"]
+    command: postgres -c config_file=/etc/postgresql/postgresql.conf -c archive_mode=off -c log_rotation_age=${LOG_ROTATION_MIN:-1}min
+    environment:
+      <<: *pgbackrest-env
+    volumes:
+      - ./config/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+      - ./config/postgresql.conf:/etc/postgresql/postgresql.conf:ro
+    depends_on:
+      - medivault-db
+    networks:
+      medivault-net:
+        ipv4_address: 172.28.0.14
+
+  # Garage: self-hosted S3-compatible object storage. No ports published.
+  garage:
+    image: dxflrs/garage:v1.0.1
+    container_name: medivault_garage
+    restart: unless-stopped
+    environment:
+      GARAGE_RPC_SECRET: ${GARAGE_RPC_SECRET}
+      GARAGE_ADMIN_TOKEN: ${GARAGE_ADMIN_TOKEN}
+    volumes:
+      - ./infra/garage.toml:/etc/garage.toml:ro
+      - garage-meta:/var/lib/garage/meta
+      - garage-data:/var/lib/garage/data
+    networks:
+      medivault-net:
+        ipv4_address: 172.28.0.10
+
+  # TLS terminator for Garage's S3 API (pgBackRest requires HTTPS).
+  garage-tls:
+    image: caddy:2.8.4-alpine
+    container_name: medivault_garage_tls
+    restart: unless-stopped
+    volumes:
+      - ./infra/Caddyfile:/etc/caddy/Caddyfile:ro
+    depends_on:
+      - garage
+    networks:
+      medivault-net:
+        ipv4_address: 172.28.0.11
+
+  # One-shot: layout + buckets + access keys (idempotent).
+  garage-init:
+    <<: *pg-image
+    container_name: medivault_garage_init
+    restart: "no"
+    entrypoint: ["garage-init.sh"]
+    environment:
+      GARAGE_ADMIN_TOKEN: ${GARAGE_ADMIN_TOKEN}
+      BACKUP_BUCKET: ${BACKUP_BUCKET:-medivault-backups}
+      GARAGE_KEY_ID: ${GARAGE_KEY_ID}
+      GARAGE_KEY_SECRET: ${GARAGE_KEY_SECRET}
+      AUDIT_BUCKET: ${AUDIT_BUCKET:-medivault-audit}
+      AUDIT_KEY_ID: ${AUDIT_KEY_ID}
+      AUDIT_KEY_SECRET: ${AUDIT_KEY_SECRET}
+    depends_on:
+      - garage
+      - garage-tls
+    networks:
+      medivault-net:
+        ipv4_address: 172.28.0.12
+
 networks:
   medivault-net:
     driver: bridge
@@ -53,3 +187,7 @@ networks:
 
 volumes:
   pgdata:
+  pgsocket:
+  pglogs:
+  garage-meta:
+  garage-data:

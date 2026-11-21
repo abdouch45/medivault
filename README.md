@@ -28,6 +28,8 @@ On first launch PostgreSQL automatically runs all init scripts in `init-scripts/
 
 ### Reset the Database
 
+> Upgrading from the alpine image (before pgaudit/pgBackRest) **requires** this reset: the image is now Debian-based and the new init script `08_audit_immutability.sql` only runs on an empty volume.
+
 If you edit any init script or want a clean slate, wipe the volume and restart:
 
 ```bash
@@ -205,15 +207,15 @@ Connect as `dr_house`:
 -- Raw ciphertext (BYTEA)
 SELECT record_id, diagnosis, vital_signs FROM MedicalRecord;
 
--- Decrypted (seed data was encrypted with the dev key below)
+-- Decrypted: replace <MEDIVAULT_ENC_KEY> with the value from .env
 SELECT record_id,
-       pgp_sym_decrypt(diagnosis, 'dev_master_encryption_key_2026') AS diagnosis,
+       pgp_sym_decrypt(diagnosis, '<MEDIVAULT_ENC_KEY>') AS diagnosis,
        vital_signs
 FROM MedicalRecord;
 ```
 
-> Seed data in `06_seed_data.sql` uses the hardcoded dev key `dev_master_encryption_key_2026`.
-> New records inserted by the application should use the value of `MEDIVAULT_ENC_KEY` from `.env.example`.
+> Seed data (`07_seed_data.sh`) is encrypted with `MEDIVAULT_ENC_KEY` from `.env`, the same key the application must use.
+> A wrong key fails with `ERROR: Wrong key or corrupt data`.
 
 ### Test 5 — Tamper-Evident Audit Log
 
@@ -243,6 +245,7 @@ medivault/
 ├── .gitignore
 ├── README.md
 ├── config/
+│   ├── postgresql.conf             # Logging, pgaudit, WAL archiving (main + test server)
 │   ├── pg_hba.conf.template        # Auth rules template (TRUSTED_IP substituted by setup.sh)
 │   ├── pg_hba.conf                 # Generated — do not commit (in .gitignore)
 │   └── set-passwords.sql           # Generated — password rotation script (in .gitignore)
@@ -254,7 +257,17 @@ medivault/
 │   ├── 05_rls_policies.sql         # Row-Level Security policies per actor
 │   ├── 06_create_users.sh          # Creates 9 login users from PW_* env vars
 │   ├── 06_seed_data.sql            # Placeholder (data moved to 07_seed_data.sh)
-│   └── 07_seed_data.sh             # Inserts sample data; encrypts with MEDIVAULT_ENC_KEY
+│   ├── 07_seed_data.sh             # Inserts sample data; encrypts with MEDIVAULT_ENC_KEY
+│   └── 08_audit_immutability.sql   # Append-only AuditLog, ENABLE ALWAYS triggers, DDL guard
+├── infra/
+│   ├── postgres.Dockerfile         # postgres:16 + pgaudit + pgBackRest
+│   ├── db-entrypoint.sh            # Starts backup-loop.sh inside the DB container
+│   ├── backup-loop.sh              # Full/incr backups, encrypted on the DB server
+│   ├── log-shipper.sh              # Ships + prunes logs, saves audit anchors
+│   ├── verify-audit.sh             # In-DB chain check + off-box anchor check
+│   ├── test-entrypoint.sh          # Test server: restore latest backup, then start
+│   ├── garage-init.sh              # Buckets + access keys
+│   ├── garage.toml / Caddyfile     # Garage S3 + TLS proxy
 └── scripts/
     ├── generate-passwords.js       # Generates all passwords, writes .env.example + config/set-passwords.sql
     ├── setup.sh                    # Substitutes TRUSTED_IP into config/pg_hba.conf
@@ -271,6 +284,10 @@ Both containers share an isolated Docker bridge network (`medivault-net`, subnet
 |-----------|----|
 | `medivault_postgres` | `172.28.0.2` |
 | `medivault_pgadmin` | `172.28.0.3` |
+| `medivault_garage` (S3 API) | `172.28.0.10` |
+| `medivault_garage_tls` (HTTPS → Garage) | `172.28.0.11` |
+| `medivault_logship` (log shipper) | `172.28.0.13` |
+| `medivault_test` (migration/test) | `172.28.0.14` |
 
 pg_hba.conf rules (see `config/pg_hba.conf.template`):
 
@@ -281,3 +298,59 @@ pg_hba.conf rules (see `config/pg_hba.conf.template`):
 | TCP from `172.28.0.3/32` | app users | scram-sha-256 |
 | TCP from `TRUSTED_IP/32` | app users | scram-sha-256 |
 | TCP from anywhere else | all | reject |
+
+---
+
+## 11. Backups, Migration/Test Server & Logs
+
+### Backups — pgBackRest (physical) → Garage (S3)
+| Setting (.env) | Default | Meaning |
+|---|---|---|
+| `BACKUP_FULL_INTERVAL_MIN` | 15 | full backup interval (test value) |
+| `BACKUP_INCR_INTERVAL_MIN` | 5 | incremental backup interval (test value) |
+| `BACKUP_RETENTION_FULL` | 4 | full backups kept (older ones + their incrementals expire) |
+| `LOG_ROTATION_MIN` | 1 | new server log file every N minutes |
+| `LOG_KEEP_DAYS` | 7 | days to keep already-shipped logs locally |
+| `BACKUP_ENC_KEY` | generated | AES-256-CBC passphrase for every repo file (backups **and** WAL) |
+
+Backups run **inside the database container** (`infra/backup-loop.sh`): pgBackRest reads the data files locally, compresses and AES-256-encrypts them there, and only ciphertext is sent to Garage. `medivault_logship` has no access to the data files, the backup key or the superuser password; it connects as the auditor `aud_smith`.
+
+WAL is archived continuously (`archive_timeout=60`), so restores are point-in-time, not just to the last backup.
+
+```bash
+docker exec -u postgres medivault_postgres pgbackrest info               # list backups
+docker exec -u postgres medivault_postgres pgbackrest --type=full backup # on-demand backup
+docker logs medivault_postgres | grep "\[backup\]"                     # backup history
+```
+
+**Access control:** Garage has no public buckets. S3 user `postgres` (secret = sha256 of `POSTGRES_PASSWORD`) is the only key on `medivault-backups`; S3 user `audit-shipper` is the only key on `medivault-audit` and is held only by `medivault_logship` — the DB container never sees it.
+
+### Migration / test server
+`medivault_test` restores the latest encrypted backup on first start (proving backups actually restore), with archiving off so it never writes to the production repo. Run migrations there first, then on production.
+
+```bash
+# Refresh the test server to the newest backup
+docker compose rm -sfv medivault-test && docker compose up -d medivault-test
+```
+
+### Logs
+| Log | Implemented by | Where |
+|---|---|---|
+| Error | `log_min_messages`, `log_min_error_statement` (failed SQL text) | `pglogs` volume → `medivault-audit/logs/` |
+| Transaction | WAL, `archive_mode=on` | `medivault-backups` (encrypted) |
+| Access | `log_connections` / `log_disconnections` (user, db, client IP) | `pglogs` volume → `medivault-audit/logs/` |
+| Audit | pgaudit (read, write, ddl, role) + `AuditLog` hash chain | logs + table, chain anchored in `medivault-audit/anchors/` |
+
+Postgres starts a new log file every `LOG_ROTATION_MIN` minutes (default 1). Each finished file is shipped once, with its SHA-256 in the object name, so a later local edit produces a new object instead of overwriting the original. Local copies already in Garage are deleted after `LOG_KEEP_DAYS` (default 7). A shorter rotation means a smaller window in which a superuser could edit a log before it leaves the server, at the cost of more files.
+
+### Audit-log immutability
+- `UPDATE`/`DELETE`/`TRUNCATE` on `AuditLog` fail for everyone, **including the superuser**; `adm_root` has no privilege on it at all.
+- Triggers are `ENABLE ALWAYS`, so `SET session_replication_role = replica` does not bypass them.
+- Event triggers block `ALTER`/`DROP`/`DISABLE TRIGGER` on the audit objects.
+- **Ceiling:** a superuser can still `ALTER EVENT TRIGGER … DISABLE` and rewrite the chain consistently. That is recorded by pgaudit and **detected** by the off-box anchors:
+
+```bash
+docker exec medivault_logship verify-audit.sh  # exit 0 = intact, 1 = tampered, 2 = cannot verify
+```
+
+Garage has no S3 Object Lock (WORM): off-box copies are protected by key separation, not by storage-level immutability.
